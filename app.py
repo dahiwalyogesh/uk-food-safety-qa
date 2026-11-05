@@ -2,33 +2,71 @@
 
 Retrieves the most relevant guidance documents for a question and answers
 only from those, refusing when nothing relevant is found.
+
+Startup note: the embedding model is loaded lazily rather than at import.
+A hosted web service is given a short window to open its port, and loading
+sentence-transformers plus embedding the documents takes longer than that
+window. The port is opened first; the model loads on a background thread
+immediately afterwards.
 """
 
 import os
+import threading
+
 import numpy as np
 import gradio as gr
 import anthropic
-from sentence_transformers import SentenceTransformer
 
 from documents import DOCUMENTS
 
 TOP_K = 3
 THRESHOLD = 0.25
 MODEL_NAME = "claude-haiku-5-5"
+EMBED_MODEL = "all-MiniLM-L6-v2"
 
 # ---------- documents ----------
 documents = [{"source": name, "text": text} for name, text in DOCUMENTS.items()]
 
-# ---------- embeddings (computed once at startup) ----------
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
-doc_vecs = embedder.encode([d["text"] for d in documents])
+# ---------- lazily loaded state ----------
+_state = {"embedder": None, "doc_vecs": None, "client": None, "error": None}
+_lock = threading.Lock()
 
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+def load():
+    """Load the embedding model and API client once, on first use.
+
+    Guarded by a lock so two simultaneous requests cannot load it twice.
+    """
+    if _state["embedder"] is not None or _state["error"] is not None:
+        return _state
+
+    with _lock:
+        if _state["embedder"] is not None or _state["error"] is not None:
+            return _state
+        try:
+            key = os.environ.get("ANTHROPIC_API_KEY")
+            if not key:
+                raise RuntimeError(
+                    "ANTHROPIC_API_KEY is not set in the environment.")
+
+            from sentence_transformers import SentenceTransformer
+
+            embedder = SentenceTransformer(EMBED_MODEL)
+            _state["doc_vecs"] = embedder.encode(
+                [d["text"] for d in documents])
+            _state["client"] = anthropic.Anthropic(api_key=key)
+            _state["embedder"] = embedder
+        except Exception as exc:  # surfaced in the UI rather than crashing
+            _state["error"] = str(exc)
+
+    return _state
 
 
 def similarity(question):
     """Cosine similarity between the question and every document."""
-    q_vec = embedder.encode(question)
+    s = load()
+    q_vec = s["embedder"].encode(question)
+    doc_vecs = s["doc_vecs"]
     return np.dot(doc_vecs, q_vec) / (
         np.linalg.norm(doc_vecs, axis=1) * np.linalg.norm(q_vec))
 
@@ -43,7 +81,7 @@ def retrieve(question):
 
 
 def ask_model(prompt):
-    response = client.messages.create(
+    response = load()["client"].messages.create(
         model=MODEL_NAME,
         max_tokens=1000,
         messages=[{"role": "user", "content": prompt}],
@@ -57,6 +95,10 @@ def ask_model(prompt):
 def answer(question):
     if not question or not question.strip():
         return "Please enter a question."
+
+    s = load()
+    if s["error"]:
+        return f"The service could not start: {s['error']}"
 
     hits = retrieve(question)
     if not hits:
@@ -90,7 +132,9 @@ demo = gr.Interface(
     description=(
         "Answers questions from 22 UK food safety guidance documents. "
         "Retrieves the relevant passages and answers only from those. "
-        "Says so when it does not know."
+        "Says so when it does not know. "
+        "The first question after the service wakes can take a minute "
+        "while the embedding model loads."
     ),
     article=(
         "Summarised from Food Standards Agency guidance. "
@@ -107,6 +151,10 @@ demo = gr.Interface(
 )
 
 if __name__ == "__main__":
+    # Warm the model in the background so the first visitor does not wait,
+    # while the port below opens straight away.
+    threading.Thread(target=load, daemon=True).start()
+
     demo.launch(
         server_name="0.0.0.0",
         server_port=int(os.environ.get("PORT", 7860)),
