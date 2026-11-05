@@ -1,4 +1,4 @@
 gradio>=5.0
-sentence-transformers>=3.0
+fastembed>=0.9
 anthropic>=0.40
 numpy>=1.26
