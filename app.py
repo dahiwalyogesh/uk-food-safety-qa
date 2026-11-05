@@ -15,6 +15,13 @@ Two hosting constraints shape this file:
 """
 
 import os
+
+# Must be set before ONNX Runtime is imported. Without this, the runtime
+# sizes its thread pools from the host's core count, not this container's
+# share of a core, and allocates a stack per thread. On a 512 MB instance
+# that alone is enough to get the process killed.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import threading
 
 import numpy as np
@@ -55,9 +62,9 @@ def load():
 
             from fastembed import TextEmbedding
 
-            embedder = TextEmbedding(EMBED_MODEL)
-            _state["doc_vecs"] = np.array(
-                list(embedder.embed([d["text"] for d in documents])))
+            embedder = TextEmbedding(EMBED_MODEL, threads=1)
+            _state["doc_vecs"] = np.array(list(embedder.embed(
+                [d["text"] for d in documents], batch_size=4)))
             _state["client"] = anthropic.Anthropic(api_key=key)
             _state["embedder"] = embedder
         except Exception as exc:  # surfaced in the UI rather than crashing
