@@ -119,9 +119,12 @@ letting the model state the gap produced a more useful answer. The expectations
 were wrong, not the system — but the distinction matters, and changing a test
 to raise a score would not have been legitimate.
 
-The scores in this README were measured with the PyTorch build of the model.
-The deployed app runs the same weights through ONNX Runtime; the
-**Retrieval scores** tab shows the live numbers.
+The threshold was first measured with the PyTorch build of the model. After the
+deployment switched to ONNX Runtime, the same eleven probe questions were
+re-run against the live app rather than assumed to be unchanged. The ranges
+came back identical — relevant 0.338 – 0.730, off topic 0.018 – 0.224 — which
+confirms the runtime change did not move the vectors. The **Retrieval scores**
+tab shows the live number for any question.
 
 ## Running it yourself
 
