@@ -1,5 +1,13 @@
 # UK Food Safety Q&A
 
+[![Live demo](https://img.shields.io/badge/Live_demo-Open_the_app-2ea44f?style=for-the-badge)](https://uk-food-safety-qa.onrender.com)
+
+**Live app: https://uk-food-safety-qa.onrender.com**
+
+> Hosted on a free instance, which sleeps after 15 minutes of no traffic.
+> The first request after it wakes takes about a minute while the embedding
+> model loads. Later requests are fast.
+
 A retrieval-augmented generation (RAG) system that answers questions about UK
 food safety guidance from 22 source documents, and says so when it does not
 know.
@@ -16,10 +24,15 @@ ask a question.
 | Stage | Implementation |
 |---|---|
 | Chunking | Each document is ~200 words covering one topic, so a document is already a chunk. Splitting further would break coherent topics. |
-| Embedding | `all-MiniLM-L6-v2`, 384 dimensions, computed once at startup |
+| Embedding | `all-MiniLM-L6-v2`, 384 dimensions, run through ONNX Runtime, computed once on first use |
 | Retrieval | Cosine similarity, top 3 documents above a 0.25 threshold |
-| Generation | Claude Haiku, temperature 0, answering only from the retrieved text |
+| Generation | Claude Haiku, answering only from the retrieved text |
 | Refusal | Below-threshold questions return nothing; the prompt also requires the model to say when an answer is absent |
+
+The app has two tabs. **Ask** answers questions. **Retrieval scores** shows the
+cosine similarity for every document and whether anything cleared the
+threshold. Retrieval is the half of a RAG system that fails quietly, so it is
+worth making visible rather than leaving it as a black box.
 
 ## Setting the threshold
 
@@ -47,6 +60,32 @@ and is the harder test.
 | Colloquial questions (9) | 8/9 |
 | Out-of-scope correctly refused | 5/5 |
 
+## Getting it running in production
+
+The system worked in a notebook long before it worked when deployed. Three
+things broke, none of them to do with the retrieval logic.
+
+**1. The app was killed before it could start.** A hosted web service is given
+roughly 40 seconds to open its port. The original code loaded the model and
+embedded every document *before* calling `launch()`, which took minutes, so
+the platform killed it every time. Fix: open the port first, load the model on
+a background thread afterwards.
+
+**2. A failed deploy blocked the fix.** The broken deploy sat retrying for 19
+minutes, and because only one deploy runs at a time, the corrected version
+never started building. Worth knowing that a stuck deploy has to be cancelled,
+not waited out.
+
+**3. PyTorch did not fit in 512 MB.** Installing `sentence-transformers` pulls
+in PyTorch and the entire CUDA stack — on a server with no GPU. The process
+was killed by the OS with no traceback, which is the signature of running out
+of memory rather than a crash. Fix: run the same model weights through ONNX
+Runtime instead, and pin the thread count, since the runtime otherwise sizes
+its thread pools from the host's core count rather than the container's share.
+
+The embedding model is unchanged throughout — same weights, same 384
+dimensions. Only the runtime executing it differs.
+
 ## What doesn't work
 
 - **Questions about elapsed time retrieve poorly.** "Sauce been out since 11,
@@ -67,7 +106,8 @@ and is the harder test.
 ## What I would do differently
 
 Use a proper vector database rather than NumPy; chunk on section boundaries
-once the corpus grows; add a re-ranking step after retrieval; and build the
+once the corpus grows; add a re-ranking step after retrieval; precompute the
+document embeddings at build time rather than on first request; and build the
 test set before writing any retrieval code rather than after.
 
 ## Evaluation notes
@@ -78,6 +118,18 @@ retrieval stage; measurement showed that retrieving related documents and
 letting the model state the gap produced a more useful answer. The expectations
 were wrong, not the system — but the distinction matters, and changing a test
 to raise a score would not have been legitimate.
+
+The scores in this README were measured with the PyTorch build of the model.
+The deployed app runs the same weights through ONNX Runtime; the
+**Retrieval scores** tab shows the live numbers.
+
+## Running it yourself
+
+```bash
+pip install -r requirements.txt
+export ANTHROPIC_API_KEY=...   # never commit this
+python app.py
+```
 
 ## Source material
 
