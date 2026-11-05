@@ -3,11 +3,15 @@
 Retrieves the most relevant guidance documents for a question and answers
 only from those, refusing when nothing relevant is found.
 
-Startup note: the embedding model is loaded lazily rather than at import.
-A hosted web service is given a short window to open its port, and loading
-sentence-transformers plus embedding the documents takes longer than that
-window. The port is opened first; the model loads on a background thread
-immediately afterwards.
+Two hosting constraints shape this file:
+
+1. A hosted web service is given a short window to open its port, and
+   loading the embedding model takes longer than that window. So the port
+   is opened first and the model loads on a background thread afterwards.
+
+2. The instance has 512 MB of memory. The same model is run through ONNX
+   Runtime rather than PyTorch, whose CPU build plus the framework around
+   it does not fit. The weights are identical; only the runtime differs.
 """
 
 import os
@@ -22,7 +26,7 @@ from documents import DOCUMENTS
 TOP_K = 3
 THRESHOLD = 0.25
 MODEL_NAME = "claude-haiku-5-5"
-EMBED_MODEL = "all-MiniLM-L6-v2"
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # ---------- documents ----------
 documents = [{"source": name, "text": text} for name, text in DOCUMENTS.items()]
@@ -49,11 +53,11 @@ def load():
                 raise RuntimeError(
                     "ANTHROPIC_API_KEY is not set in the environment.")
 
-            from sentence_transformers import SentenceTransformer
+            from fastembed import TextEmbedding
 
-            embedder = SentenceTransformer(EMBED_MODEL)
-            _state["doc_vecs"] = embedder.encode(
-                [d["text"] for d in documents])
+            embedder = TextEmbedding(EMBED_MODEL)
+            _state["doc_vecs"] = np.array(
+                list(embedder.embed([d["text"] for d in documents])))
             _state["client"] = anthropic.Anthropic(api_key=key)
             _state["embedder"] = embedder
         except Exception as exc:  # surfaced in the UI rather than crashing
@@ -65,7 +69,7 @@ def load():
 def similarity(question):
     """Cosine similarity between the question and every document."""
     s = load()
-    q_vec = s["embedder"].encode(question)
+    q_vec = np.array(list(s["embedder"].embed([question]))[0])
     doc_vecs = s["doc_vecs"]
     return np.dot(doc_vecs, q_vec) / (
         np.linalg.norm(doc_vecs, axis=1) * np.linalg.norm(q_vec))
@@ -120,7 +124,31 @@ Answer directly. Do not refer to "the context" or "the guidance"."""
     return reply + "\n\n---\n\n**Sources:** " + ", ".join(sources)
 
 
-demo = gr.Interface(
+def scores(question):
+    """Show the raw similarity scores behind a question.
+
+    Retrieval is the half of a RAG system that usually fails, and it fails
+    quietly. This makes it visible: which documents were closest, how close,
+    and whether anything cleared the threshold.
+    """
+    if not question or not question.strip():
+        return "Enter a question."
+
+    s = load()
+    if s["error"]:
+        return f"The service could not start: {s['error']}"
+
+    sc = similarity(question)
+    top = np.argsort(sc)[::-1][:5]
+
+    lines = [f"Highest score: **{sc.max():.3f}** (threshold {THRESHOLD})", ""]
+    lines += [f"- `{sc[i]:.3f}` &nbsp; {documents[i]['source']}" for i in top]
+    if sc.max() < THRESHOLD:
+        lines.append("\nNothing clears the threshold, so the system refuses.")
+    return "\n".join(lines)
+
+
+ask = gr.Interface(
     fn=answer,
     inputs=gr.Textbox(
         label="Question",
@@ -148,6 +176,26 @@ demo = gr.Interface(
         "staff member cut their hand, what now",
     ],
     flagging_mode="never",
+)
+
+diagnostics = gr.Interface(
+    fn=scores,
+    inputs=gr.Textbox(label="Question", lines=2),
+    outputs=gr.Markdown(label="Similarity scores"),
+    title="Retrieval scores",
+    description=(
+        "The cosine similarity between your question and each document. "
+        f"Anything below {THRESHOLD} is treated as 'not in the documents'. "
+        "The threshold was set by measuring relevant and off-topic questions "
+        "and picking a value in the gap between them."
+    ),
+    flagging_mode="never",
+)
+
+demo = gr.TabbedInterface(
+    [ask, diagnostics],
+    ["Ask", "Retrieval scores"],
+    title="UK Food Safety Q&A",
 )
 
 if __name__ == "__main__":
